@@ -4,19 +4,15 @@ import (
 	"context"
 	"fmt"
 	"log"
+	"log/slog"
 	"sync"
+	"time"
+
+	"github.com/cloudflare/backoff"
 )
 
-type ParentConfigFunc func(parent, key string) any
-
-func NoParentConfig(_, _ string) any {
-	return nil
-}
-
 type Runner interface {
-	Setup(context.Context, ParentConfigFunc) Runner
 	Run(context.Context) error
-	RunConfig(string) any
 }
 
 func mergeContexts(ctxs ...context.Context) (context.Context, context.CancelFunc) {
@@ -47,26 +43,46 @@ type work struct {
 }
 
 type Graph struct {
-	workDAG map[string]*work
+	workDAG    map[string]*work
+	sequential bool
+	logger     *slog.Logger
+
+	started   sync.Map
+	completed sync.Map
+	backoff   *backoff.Backoff
 }
 
-func (g *Graph) Setup(_ context.Context, _ ParentConfigFunc) Runner {
-	return g
-}
+type GraphOption func(*Graph)
 
-func (g *Graph) RunConfig(string) any {
-	return nil
-}
-
-func NewGraph() *Graph {
-	return &Graph{
-		workDAG: make(map[string]*work),
+func WithSequential(sequential bool) GraphOption {
+	return func(g *Graph) {
+		g.sequential = sequential
 	}
 }
 
-type WorkOptions func(*work) error
+func WithLogger(logger *slog.Logger) GraphOption {
+	return func(g *Graph) {
+		if logger != nil {
+			g.logger = logger
+		}
+	}
+}
 
-func WithParents(parents ...string) WorkOptions {
+func NewGraph(opts ...GraphOption) *Graph {
+	g := &Graph{
+		workDAG: make(map[string]*work),
+		logger:  slog.New(slog.DiscardHandler),
+		backoff: backoff.New(5*time.Second, time.Millisecond),
+	}
+	for _, opt := range opts {
+		opt(g)
+	}
+	return g
+}
+
+type WorkOption func(*work) error
+
+func WithParents(parents ...string) WorkOption {
 	return func(w *work) error {
 		w.parents = make(map[string]struct{}, len(parents))
 		for _, parent := range parents {
@@ -76,14 +92,14 @@ func WithParents(parents ...string) WorkOptions {
 	}
 }
 
-func WithRunner(runner Runner) WorkOptions {
+func WithRunner(runner Runner) WorkOption {
 	return func(w *work) error {
 		w.runner = runner
 		return nil
 	}
 }
 
-func (g *Graph) Add(name string, opts ...WorkOptions) error {
+func (g *Graph) Add(name string, opts ...WorkOption) error {
 	w := &work{
 		name: name,
 	}
@@ -105,86 +121,103 @@ func (g *Graph) Run(ctx context.Context) error {
 		cancel   context.CancelFunc
 		children []string
 	}
-	started := map[string]dagData{}
 
-	var toStart []*work
+	var wg sync.WaitGroup
 
-	for _, w := range g.workDAG {
-		toStart = append(toStart, w)
-	}
-
-	for len(toStart) > 0 {
-		w := toStart[0]
-		toStart = toStart[1:]
-		canStart := true
-		parentContexts := []context.Context{ctx}
-		for parent := range w.parents {
-			if s, ok := started[parent]; !ok {
-				canStart = false
-				break
-			} else {
-				parentContexts = append(parentContexts, s.ctx)
-			}
-		}
-		if !canStart {
+	startCh := make(chan struct{})
+	go func() {
+		defer close(startCh)
+		var toStart []*work
+		for _, w := range g.workDAG {
 			toStart = append(toStart, w)
-			continue
 		}
+		for len(toStart) > 0 {
+			g.logger.Info("in start loop")
+			select {
+			case <-ctx.Done():
+				g.logger.Info("start loop context canceled")
+				return
+			case <-time.After(g.backoff.Duration()):
+			}
+			w := toStart[0]
+			toStart = toStart[1:]
+			canStart := true
+			parentContexts := []context.Context{ctx}
+			for parent := range w.parents {
+				if g.sequential {
+					if _, ok := g.completed.Load(parent); !ok {
+						g.logger.Info("sequential runner with incomplete parents", "name", w.name, "parent", parent)
+						canStart = false
+						break
+					}
+				} else {
+					if s, ok := g.started.Load(parent); !ok {
+						g.logger.Info("parallel runner with incomplete parents", "name", w.name, "parent", parent)
+						canStart = false
+						break
+					} else {
+						parentContexts = append(parentContexts, s.(dagData).ctx)
+					}
+				}
+			}
+			if !canStart {
+				toStart = append(toStart, w)
+				continue
+			}
 
-		// when parent context is canceled, cancel the child context.
-		workCtx, cancel := mergeContexts(parentContexts...)
-		w.runner = w.runner.Setup(workCtx, func(parent, key string) any {
-			p, ok := g.workDAG[parent]
-			if !ok {
-				panic(fmt.Errorf("dag: parent %q does not exist", parent))
-			}
-			_, ok = started[parent]
-			if !ok {
-				panic(fmt.Sprintf("dag: parent %q has not been started, are you sure this is a parent?", parent))
-			}
-			return p.runner.RunConfig(key)
+			// when parent context is canceled, cancel the child context.
+			workCtx, cancel := mergeContexts(parentContexts...)
+			w.done = make(chan struct{})
+			go func() {
+				g.logger.Info("starting runner", "name", w.name)
+				err := w.runner.Run(workCtx)
+				if err != nil {
+					g.logger.Error("runner failed", "name", w.name, "error", err)
+				}
+				cancel()
+				close(w.done)
+			}()
+			go func() {
+				<-w.done
+				g.logger.Info("runner completed", "name", w.name)
+				g.completed.Store(w.name, struct{}{})
+				g.started.Delete(w.name)
+			}()
+			wg.Go(func() {
+			<-w.done
+			g.logger.Info("wait group worker completed", "name", w.name)
 		})
-		w.done = make(chan struct{})
-		go func() {
-			err := w.runner.Run(workCtx)
-			if err != nil {
-				log.Printf("runner failed: %v", err)
-			}
-			cancel()
-			close(w.done)
-		}()
 
-		var children []string
-		for c, cw := range g.workDAG {
-			if _, ok := cw.parents[w.name]; ok {
-				children = append(children, c)
+			var children []string
+			for c, cw := range g.workDAG {
+				if _, ok := cw.parents[w.name]; ok {
+					children = append(children, c)
+				}
 			}
+			g.started.Store(w.name, dagData{
+				ctx:      workCtx,
+				cancel:   cancel,
+				children: children,
+			})
 		}
-		started[w.name] = dagData{
-			ctx:      workCtx,
-			cancel:   cancel,
-			children: children,
-		}
-	}
+	}()
 
 	completed := make(chan struct{})
-	var wg sync.WaitGroup
-	for _, w := range g.workDAG {
-		wg.Go(func() {
-			<-w.done
-		})
-	}
 	go func() {
+		<-startCh
 		wg.Wait()
+		g.logger.Info("wait group completed")
 		close(completed)
 	}()
 
 	select {
 	case <-ctx.Done(): // cancel all jobs
 		var toStop []string
-		for name := range started {
-			toStop = append(toStop, name)
-		}
+		g.started.Range(func(key any, _ any) bool {
+			toStop = append(toStop, key.(string))
+			return true
+		})
+		g.logger.Info("main loop context canceled", "toStop", toStop)
 		for len(toStop) > 0 {
 			name := toStop[0]
 			toStop = toStop[1:]
@@ -193,12 +226,13 @@ func (g *Graph) Run(ctx context.Context) error {
 			if !ok {
 				log.Fatalf("wtf: %v is not in workDAG", name)
 			}
-			s, ok := started[name]
+			s, ok := g.started.Load(name)
 			if !ok {
 				continue
 			}
-			for _, child := range s.children {
-				if _, ok := started[child]; ok {
+			ss := s.(dagData)
+			for _, child := range ss.children {
+				if _, ok := g.started.Load(child); ok {
 					canStop = false
 					break
 				}
@@ -207,12 +241,12 @@ func (g *Graph) Run(ctx context.Context) error {
 				toStop = append(toStop, name)
 				continue
 			}
-			started[name].cancel()
+			ss.cancel()
 			<-w.done
-			delete(started, name)
+			g.started.Delete(name)
 		}
 		return ctx.Err()
 	case <-completed:
+		return nil
 	}
-	return nil
 }
